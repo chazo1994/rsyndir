@@ -3,50 +3,97 @@ from twisted.internet.protocol import ReconnectingClientFactory
 from autobahn.twisted.choosereactor import install_reactor
 import os, sys, logging
 import time
+import threading
 
-from syncdir import utils, tree
+from syncdir import utils
 reactor = install_reactor()
 
+class DirManagerThread(threading.Thread):
+    def __init__(self, dirmanager, rlock):
+        self.dirmanager = dirmanager
+        self.rlock = rlock
+        self.sender = None
+
+    def set_sender(self, sender):
+        self.sender = sender
+    def run(self):
+        while True:
+            time.sleep(0.1)
+            self.rlock.acquire()
+            try:
+                total_change = self.dirmanager.update_status()
+
+            except Exception as e:
+                print(e.message())
+                self.rlock.release()
+                continue
+            finally:
+                self.rlock.release()
+            if self.sender is None:
+                continue
+            if total_change != 0:
+                self.sender.send_data()
+
+
+
+
 class SourceSyncProtocol(WebSocketClientProtocol):
-    def __init__(self, root_node):
-        self.root_node = root_node
+    def __init__(self, dirmanager_thread, dirmanager, rlock):
+        self.dirmanager_thread = dirmanager_thread
+        self.rlock = rlock
+        self.dirmanager =dirmanager
         self.is_busy = False
         self.isSending = False
-        self.END_KEY = "end"
         self.index = 0
+        self.START_HEADER = "START_HEADER"
+        self.END_HEADER = "END_HEADER"
+        self.START_DATA = "START_DATA"
+        self.END_DATA = "END_DATA"
+        self.FRAGMENT_SIZE = 64
         WebSocketClientProtocol.__init__(self)
+        dirmanager_thread.set_sender(self)
 
     def onConnect(self, response):
         print("Server connected: {0}".format(response.peer))
         self.factory.resetDelay()
 
+    def onOpen(self):
+        print("WebSocket connection open.")
+
+
+
     def sendHello(self):
         self.sendMessage("Hello, world!".encode('utf8'))
         self.sendMessage(b"\x00\x01\x03\x04", isBinary=True)
-    def sendfiles(self):
-        current_node = root_node
-        while True:
-            for children in current_node.childrens:
+    def send_data(self):
+        self.is_sending = True
+        self.rlock.acquire()
+        try:
+            self.safeSendMessage(self.START_HEADER)
+            for line in self.dirmanager.table:
+                self.safeSendMessage(line.strip())
+            self.safeSendMessage(self.END_HEADER)
+            self.safeSendMessage(self.START_DATA)
+            #### TODO something
 
-                if children.state != 0:
-                    if os.path.isdir(children.path):
-                        ##send dir
-                        pass
-                    else:
-                        ##send file
-                        pass
+        except Exception as e:
+            pass
+        finally:
+            self.is_sending = False
+
 
 
 
     def onMessage(self, payload, isBinary):
-
         if not isBinary:
             pass
         else:
             pass
 
-    #@synchronized_with_attr("lock")
+    ##@synchronized_with_attr("lock")
     def sendMessage(self, payload, isBinary=False, fragmentSize=None):
+        if fragmentSize == None:
+            fragmentSize = self.FRAGMENT_SIZE
         #super(MerlinClientProtocol,self).sendMessage(payload, isBinary, fragmentSize=fragmentSize)
         if not isBinary:
             super(SourceSyncProtocol, self).sendMessage(payload, isBinary)
@@ -85,7 +132,7 @@ class SourceSyncClientFactory(WebSocketClientFactory, ReconnectingClientFactory)
     """
 
     def buildProtocol(self, addr):
-        proto = SourceSyncProtocol(self.root_node)
+        proto = SourceSyncProtocol(self.dirmanager_thread, self.dirmanager, self.rlock)
         proto.factory = self
         return proto
 
@@ -134,34 +181,30 @@ if __name__ == '__main__':
     print("link: %s" % args.websocket)
     # start a WebSocket client
     wsfactory = SourceSyncClientFactory(args.wsurl)
-    root_node = utils.build_dir_tree(args.rootdir)
-    wsfactory.root_node = root_node
+    if not os.path.exists(args.rootdir):
+        raise IOError("No such file or directory")
+    checkpoint = os.path.join(args.rootdir, ".checkpoint")
+    dirmanager = utils.DirManager(checkpoint, args.rootdir)
+
+    rlock = threading.RLock()
+    dirmanager_thread = DirManagerThread(dirmanager, rlock)
+
+    wsfactory.dirmanager_thread = dirmanager_thread
+    wsfactory.dirmanager = dirmanager
+    wsfactory.dirmanager.rlock = rlock
+    dirmanager_thread.start()
     websocket_params = args.websocket.split(":")
-    while True:
-        time.sleep(0.01)
-        total_change = utils.update_status(root_node)
-        if total_change == 0:
-            continue
-        root_node.total_change = total_change
-        if websocket_params[0] == "unix":
-            reactor.connectUNIX(websocket_params[1], wsfactory)
-        elif websocket_params[0] == "tcp":
-            port = 8081
-            try:
-                port = int(websocket_params[2])
-            except:
-                print("TCP port parse error")
-                sys.exit(1)
-            reactor.connectTCP(websocket_params[1], port, wsfactory)
-        else:
-            print("This protocol not be supported yet!")
-            sys.exit(2)
-    # wsclient = clientFromString(reactor, args.websocket)
-    # wsclient.connect(wsfactory)
-
-    #reactor.connectTCP("127.0.0.1", 8081, wsfactory)
-    #reactor.connectUNIX("/tmp/mywebsocket",wsfactory)
+    if websocket_params[0] == "unix":
+        reactor.connectUNIX(websocket_params[1], wsfactory)
+    elif websocket_params[0] == "tcp":
+        port = 8081
+        try:
+            port = int(websocket_params[2])
+        except:
+            print("TCP port parse error")
+            sys.exit(1)
+        reactor.connectTCP(websocket_params[1], port, wsfactory)
+    else:
+        print("This protocol not be supported yet!")
+        sys.exit(2)
     reactor.run()
-
-    # now enter the Twisted reactor loop
-    #reactor.run()
